@@ -53,12 +53,21 @@ async function runOnce() {
     return;
   }
 
-  // 2) Fetch pickable availability from inventory_batch_view
-  const skus = Array.from(demand.keys());
-  // Pickable availability: compute from stock levels excluding BackStock & Production
+  // 2) Fetch client_inventory mapping first
+  const { data: ciRows, error: ciErr } = await supabase
+    .from('client_inventory')
+    .select('id, sku, client_id');
+  if (ciErr) {
+    console.error('[Cron] client_inventory error:', ciErr);
+    return;
+  }
+  const idToSku = new Map((ciRows || []).map(r => [String(r.id), normalizeSku(r.sku)]));
+  const idToClientId = new Map((ciRows || []).map(r => [String(r.id), r.client_id]));
+  
+  // 3) Fetch pickable availability from stock levels excluding BackStock & Production
   const { data: pickableRows, error: pickErr } = await supabase
     .from('inventory_stock_levels')
-    .select('item_type, item_id, available, location_id, inventory_locations!inner(type), client_inventory!inner(id, sku, client_id)')
+    .select('item_type, item_id, available, location_id, inventory_locations!inner(type)')
     .eq('item_type', 'client_product')
     .neq('inventory_locations.type', 'BackStock')
     .neq('inventory_locations.type', 'Production');
@@ -68,15 +77,15 @@ async function runOnce() {
   }
   const pickable = new Map();
   for (const r of pickableRows || []) {
-    const sku = normalizeSku(r.client_inventory?.sku);
+    const sku = idToSku.get(String(r.item_id));
     if (!sku) continue;
-    const prev = pickable.get(sku) || { available: 0, client_id: r.client_inventory?.client_id || null };
+    const client_id = idToClientId.get(String(r.item_id));
+    const prev = pickable.get(sku) || { available: 0, client_id };
     prev.available += (r.available || 0);
-    prev.client_id = prev.client_id || r.client_inventory?.client_id || null;
     pickable.set(sku, prev);
   }
 
-  // 3) Backstock and total supply by SKU
+  // 4) Backstock and total supply by SKU
   const { data: stockRows, error: stockErr } = await supabase
     .from('inventory_stock_levels')
     .select('item_type, item_id, on_hand, location_id, inventory_locations!inner(code, type)')
@@ -86,16 +95,8 @@ async function runOnce() {
     return;
   }
 
-  // Map from item_id not directly usable without joining to SKU; for this first job,
-  // we’ll approximate by accumulating by location type using the batch view SKUs set.
   const backstockBySku = new Map();
   const totalBySku = new Map();
-
-  // NOTE: To properly map item_id -> sku, consider a join to client_inventory.
-  const { data: ciRows } = await supabase
-    .from('client_inventory')
-    .select('id, sku');
-  const idToSku = new Map((ciRows || []).map(r => [String(r.id), normalizeSku(r.sku)]));
 
   for (const r of stockRows || []) {
     const sku = idToSku.get(String(r.item_id));
@@ -106,7 +107,7 @@ async function runOnce() {
     }
   }
 
-  // 4) Upsert alerts
+  // 5) Upsert alerts
   for (const [sku, qtyNeeded] of demand.entries()) {
     const pick = pickable.get(sku) || { available: 0, client_id: null };
     const back = backstockBySku.get(sku) || 0;
