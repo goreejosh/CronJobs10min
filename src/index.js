@@ -1,7 +1,7 @@
 import cron from 'node-cron';
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { buildSkuMaps, resolveSku } from '../../server/utils/skuResolver.js';
+import { buildSkuMaps, resolveSku } from './utils/skuResolver.js';
 
 // Load env
 const SUPABASE_URL = process.env.SUPABASE_URL;
