@@ -1,0 +1,16 @@
+{
+  "name": "canvas-cron-jobs-local",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5",
+    "@supabase/supabase-js": "^2.45.4"
+  }
+}
