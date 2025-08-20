@@ -124,6 +124,7 @@ async function runOnce() {
         .update({ is_active: false, updated_at: new Date().toISOString() })
         .eq('item_type', 'client_product')
         .eq('message', sku)
+        .eq('client_id', pick.client_id || null)
         .eq('is_active', true);
       continue;
     }
@@ -133,7 +134,7 @@ async function runOnce() {
     const client_id = pick.client_id || null;
 
     // upsert by (client_id, item_type, message, alert_type, is_active=true)
-    await supabase.from('inventory_alerts').upsert({
+    const payload = {
       item_type: 'client_product',
       item_id: null,
       alert_type: alertType,
@@ -142,7 +143,42 @@ async function runOnce() {
       is_active: true,
       client_id,
       updated_at: new Date().toISOString()
-    }, { onConflict: 'message' });
+    };
+
+    // First try native upsert with a stable composite key
+    const { error: upsertErr } = await supabase
+      .from('inventory_alerts')
+      .upsert(payload, { onConflict: 'client_id,item_type,alert_type,message' });
+
+    if (upsertErr) {
+      console.error('[Cron] inventory_alerts upsert error; attempting fallback:', upsertErr);
+
+      // Fallback: emulate upsert without requiring DB unique index
+      const { data: existing, error: selErr } = await supabase
+        .from('inventory_alerts')
+        .select('id')
+        .eq('client_id', client_id)
+        .eq('item_type', 'client_product')
+        .eq('alert_type', alertType)
+        .eq('message', message)
+        .eq('is_active', true)
+        .maybeSingle();
+
+      if (selErr) {
+        console.error('[Cron] inventory_alerts select error:', selErr);
+      } else if (existing?.id) {
+        const { error: updErr } = await supabase
+          .from('inventory_alerts')
+          .update({ severity, updated_at: new Date().toISOString() })
+          .eq('id', existing.id);
+        if (updErr) console.error('[Cron] inventory_alerts update error:', updErr);
+      } else {
+        const { error: insErr } = await supabase
+          .from('inventory_alerts')
+          .insert([payload]);
+        if (insErr) console.error('[Cron] inventory_alerts insert error:', insErr);
+      }
+    }
   }
 
   console.log('[Cron] Completed alert evaluation');
