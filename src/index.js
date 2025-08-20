@@ -1,7 +1,7 @@
 import cron from 'node-cron';
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { buildSkuMaps, resolveSku } from './utils/skuResolver.js';
+import { buildSkuMaps, buildClientSkuMap, resolveSku, normalizeSku } from './utils/skuResolver.js';
 
 // Load env
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -17,9 +17,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { autoRefreshToken: false, persistSession: false }
 });
 
-// Minimal SKU resolver (delegates to DB for now) – for more advanced matching,
-// we can import local maps or call an API; placeholder to keep structure.
-const normalizeSku = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
+// Runtime controls for shipment reconciliation
+const RECON_LOOKBACK_HOURS = parseInt(process.env.RECON_LOOKBACK_HOURS || '24', 10);
+const RECON_PAGE_SIZE = parseInt(process.env.RECON_PAGE_SIZE || '500', 10);
+const RECON_MAX_PAGES = parseInt(process.env.RECON_MAX_PAGES || '20', 10);
 
 async function runOnce() {
   const startedAt = new Date().toISOString();
@@ -63,6 +64,7 @@ async function runOnce() {
   }
   const idToSku = new Map((ciRows || []).map(r => [String(r.id), normalizeSku(r.sku)]));
   const idToClientId = new Map((ciRows || []).map(r => [String(r.id), r.client_id]));
+  const clientSkuMap = buildClientSkuMap(ciRows || []);
   
   // 3) Fetch pickable availability from stock levels excluding BackStock & Production
   const { data: pickableRows, error: pickErr } = await supabase
@@ -181,7 +183,141 @@ async function runOnce() {
     }
   }
 
-  console.log('[Cron] Completed alert evaluation');
+  // 6) Reconcile shipments → reduce inventory at Batch/Production
+  try {
+    const sinceIso = new Date(Date.now() - 1000 * 60 * 60 * RECON_LOOKBACK_HOURS).toISOString();
+
+    let page = 0;
+    let processed = 0;
+    while (page < RECON_MAX_PAGES) {
+      const from = page * RECON_PAGE_SIZE;
+      const to = from + RECON_PAGE_SIZE - 1;
+      const { data: shipments, error: shipErr } = await supabase
+        .from('shipments')
+        .select('id, shipment_items, order_id, order_number, ship_date, created_at, voided')
+        .gte('created_at', sinceIso)
+        .is('voided', false)
+        .order('created_at', { ascending: true })
+        .range(from, to);
+      if (shipErr) {
+        console.error('[Cron] shipments fetch error:', shipErr);
+        break;
+      }
+      if (!shipments || shipments.length === 0) break;
+
+      for (const s of shipments) {
+        const raw = s.shipment_items;
+        const items = Array.isArray(raw) ? raw : (raw?.items || raw?.ShipmentItems || []);
+
+        // Group by canonical SKU to avoid duplicate movements per shipment
+        const qtyBySku = new Map();
+        for (const itm of items) {
+          const skuRaw = itm?.sku || itm?.SKU || itm?.product?.sku || null;
+          const qty = Number(itm?.quantity ?? itm?.Quantity ?? itm?.qty ?? 1);
+          if (!skuRaw || !qty) continue;
+          const skuCanon = normalizeSku(skuRaw);
+          qtyBySku.set(skuCanon, (qtyBySku.get(skuCanon) || 0) + qty);
+        }
+
+        for (const [skuCanon, qty] of qtyBySku.entries()) {
+          if (!skuCanon || !qty) continue;
+
+          // Idempotency: check for existing movement by (reference_type, reference_id, sku)
+          let existingMove = null;
+          let existErr = null;
+          try {
+            const res = await supabase
+              .from('inventory_movements')
+              .select('id')
+              .eq('reference_type', 'shipment')
+              .eq('reference_id', String(s.id))
+              .eq('sku', skuCanon)
+              .limit(1)
+              .maybeSingle();
+            existingMove = res.data;
+            existErr = res.error;
+          } catch (e) {
+            existErr = e;
+          }
+          if (existErr) {
+            console.error('[Cron] movement existence check error:', existErr);
+          }
+          if (existingMove?.id) continue;
+
+          // Resolve to client_product or product
+          const resolved = resolveSku(skuCanon, productMap, bundleMap, clientSkuMap);
+          const itemType = resolved.matchType === 'client_product' ? 'client_product'
+            : (resolved.matchType === 'product' ? 'product' : null);
+          let itemId = null;
+          if (itemType === 'client_product') itemId = String(resolved.client?.id || '');
+          if (itemType === 'product') itemId = String(resolved.product?.id || '');
+          if (!itemType || !itemId) {
+            console.warn('[Cron] unresolved SKU for shipment', s.id, skuCanon);
+            continue;
+          }
+
+          // Find a Batch/Production location with sufficient availability
+          const { data: stockRows, error: stockFindErr } = await supabase
+            .from('inventory_stock_levels')
+            .select('id, location_id, on_hand, available, inventory_locations!inner(type, code)')
+            .eq('item_type', itemType)
+            .eq('item_id', itemId)
+            .in('inventory_locations.type', ['Batch', 'Production'])
+            .order('available', { ascending: false })
+            .limit(1);
+          if (stockFindErr) {
+            console.error('[Cron] stock lookup error:', stockFindErr);
+            continue;
+          }
+          const stock = (stockRows || [])[0];
+          const available = (stock?.available ?? stock?.on_hand ?? 0);
+          if (!stock || available < qty) {
+            console.warn('[Cron] insufficient stock at Batch/Production for', skuCanon, 'shipment', s.id);
+            continue;
+          }
+
+          // Reduce on_hand by qty
+          const newOnHand = (stock.on_hand || 0) - qty;
+          const { error: updErr } = await supabase
+            .from('inventory_stock_levels')
+            .update({ on_hand: newOnHand, updated_at: new Date().toISOString() })
+            .eq('id', stock.id);
+          if (updErr) {
+            console.error('[Cron] stock deduction error:', updErr);
+            continue;
+          }
+
+          // Insert movement for audit trail
+          const { error: movErr } = await supabase
+            .from('inventory_movements')
+            .insert([{
+              company_code: 'MAIN',
+              item_type: itemType,
+              item_id: itemId,
+              movement_type: 'shipment',
+              quantity: -Math.abs(qty),
+              quantity_before: (stock.on_hand || 0),
+              quantity_after: newOnHand,
+              reason: 'order_shipment',
+              reference_type: 'shipment',
+              reference_id: String(s.id),
+              sku: skuCanon,
+              notes: 'Reconciled via cron from shipments table'
+            }]);
+          if (movErr) console.error('[Cron] movement insert error:', movErr);
+        }
+      }
+
+      processed += shipments.length;
+      page += 1;
+      if (shipments.length < RECON_PAGE_SIZE) break; // last page
+    }
+    console.log(`[Cron] Shipment reconciliation processed ${processed} shipments in lookback window`);
+  } catch (reconErr) {
+    console.error('[Cron] shipment reconciliation fatal error:', reconErr);
+  }
+
+  console.log('[Cron] Completed alert evaluation and shipment reconciliation');
 }
 
 // Schedule

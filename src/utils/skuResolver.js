@@ -21,10 +21,25 @@ export function buildSkuMaps(products = [], bundles = []) {
   return { productMap, bundleMap };
 }
 
-export function resolveSku(rawSku, productMap = {}, bundleMap = {}) {
+export function buildClientSkuMap(clientInventory = []) {
+  const clientMap = {};
+  clientInventory.forEach((ci) => {
+    if (ci && ci.sku) {
+      clientMap[normalizeSku(ci.sku)] = ci;
+    }
+  });
+  return clientMap;
+}
+
+export function resolveSku(rawSku, productMap = {}, bundleMap = {}, clientMap = {}) {
   if (!rawSku) return { baseSku: '', matchType: null };
 
   const norm = normalizeSku(rawSku);
+
+  // Prefer explicit client inventory match first (exact)
+  if (clientMap[norm]) {
+    return { baseSku: norm, matchType: 'client_product', client: clientMap[norm] };
+  }
 
   if (bundleMap[norm]) {
     return { baseSku: norm, matchType: 'bundle', bundle: bundleMap[norm] };
@@ -35,6 +50,7 @@ export function resolveSku(rawSku, productMap = {}, bundleMap = {}) {
 
   let bestBundleKey = '';
   let bestProductKey = '';
+  let bestClientKey = '';
 
   const tryPrefix = (key, isBundle) => {
     if (norm.startsWith(key) && key.length > (isBundle ? bestBundleKey.length : bestProductKey.length)) {
@@ -44,7 +60,13 @@ export function resolveSku(rawSku, productMap = {}, bundleMap = {}) {
 
   Object.keys(bundleMap).forEach((k) => tryPrefix(k, true));
   Object.keys(productMap).forEach((k) => tryPrefix(k, false));
+  Object.keys(clientMap).forEach((k) => {
+    if (norm.startsWith(k) && k.length > bestClientKey.length) bestClientKey = k;
+  });
 
+  if (bestClientKey) {
+    return { baseSku: bestClientKey, matchType: 'client_product', client: clientMap[bestClientKey] };
+  }
   if (bestBundleKey) {
     return { baseSku: bestBundleKey, matchType: 'bundle', bundle: bundleMap[bestBundleKey] };
   }
