@@ -222,27 +222,47 @@ async function runOnce() {
         for (const [skuCanon, qty] of qtyBySku.entries()) {
           if (!skuCanon || !qty) continue;
 
-          // Idempotency: check for existing movement by (reference_type, reference_id, sku)
-          let existingMove = null;
-          let existErr = null;
+          // Locate an existing movement to use as idempotency marker and update target
+          // 1) Prefer explicit shipment reference
+          let movementForRecon = null;
+          let movementLookupError = null;
           try {
-            const res = await supabase
+            const byShipment = await supabase
               .from('inventory_movements')
-              .select('id')
+              .select('id, sku, notes')
               .eq('reference_type', 'shipment')
               .eq('reference_id', String(s.id))
-              .eq('sku', skuCanon)
               .limit(1)
               .maybeSingle();
-            existingMove = res.data;
-            existErr = res.error;
+            movementForRecon = byShipment.data;
+            movementLookupError = byShipment.error;
+            // 2) Fallback: find by order_shipment note containing order number
+            if (!movementForRecon && s.order_number) {
+              const byOrderNote = await supabase
+                .from('inventory_movements')
+                .select('id, sku, notes')
+                .eq('reason', 'order_shipment')
+                .ilike('notes', `%${s.order_number}%`)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+              movementForRecon = byOrderNote.data;
+              movementLookupError = movementLookupError || byOrderNote.error;
+            }
           } catch (e) {
-            existErr = e;
+            movementLookupError = e;
           }
-          if (existErr) {
-            console.error('[Cron] movement existence check error:', existErr);
+          if (movementLookupError) {
+            console.error('[Cron] movement lookup error:', movementLookupError);
           }
-          if (existingMove?.id) continue;
+          // If no related movement exists, skip to avoid double-deducting without a durable marker
+          if (!movementForRecon) {
+            console.warn('[Cron] No existing movement found for shipment', s.id, s.order_number || '');
+            continue;
+          }
+          // Skip if already reconciled previously (notes marker)
+          const alreadyReconciled = typeof movementForRecon.notes === 'string' && movementForRecon.notes.includes('Reconciled via cron');
+          if (alreadyReconciled) continue;
 
           // Resolve to client_product or product
           const resolved = resolveSku(skuCanon, productMap, bundleMap, clientSkuMap);
@@ -287,24 +307,17 @@ async function runOnce() {
             continue;
           }
 
-          // Insert movement for audit trail
-          const { error: movErr } = await supabase
+          // Update existing movement as the reconciliation marker (no new rows)
+          const updatedNotes = `${movementForRecon.notes ? movementForRecon.notes + ' | ' : ''}Reconciled via cron`;
+          const movementUpdate = { notes: updatedNotes };
+          if (!movementForRecon.sku) {
+            movementUpdate.sku = skuCanon; // may fail if column absent in env; error is logged below
+          }
+          const { error: movUpdErr } = await supabase
             .from('inventory_movements')
-            .insert([{
-              company_code: 'MAIN',
-              item_type: itemType,
-              item_id: itemId,
-              movement_type: 'shipment',
-              quantity: -Math.abs(qty),
-              quantity_before: (stock.on_hand || 0),
-              quantity_after: newOnHand,
-              reason: 'order_shipment',
-              reference_type: 'shipment',
-              reference_id: String(s.id),
-              sku: skuCanon,
-              notes: 'Reconciled via cron from shipments table'
-            }]);
-          if (movErr) console.error('[Cron] movement insert error:', movErr);
+            .update(movementUpdate)
+            .eq('id', movementForRecon.id);
+          if (movUpdErr) console.error('[Cron] movement update error:', movUpdErr);
         }
       }
 
