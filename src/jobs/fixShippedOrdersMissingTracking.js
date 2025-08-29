@@ -115,13 +115,17 @@ async function ensureShipmentExists(orderNumber, tracking) {
   }
   if (existing) return;
 
-  // Minimal insert – the backfill job will enrich on next run
-  const { data: orderRow } = await supabase
+  // Fetch order_id to link shipment
+  const { data: orderRow, error: ordErr } = await supabase
     .from('orders')
     .select('order_id')
     .eq('order_number', orderNumber)
     .limit(1)
     .maybeSingle();
+  if (ordErr) {
+    console.error('[FixOrders] order lookup error (ensureShipmentExists):', ordErr);
+  }
+
   const insert = {
     source: 'orders_fix_cron',
     order_number: orderNumber || null,
@@ -157,11 +161,80 @@ export async function runFixShippedOrdersMissingTracking() {
     }
     if (!orders || orders.length === 0) break;
 
+    // Pre-batch lookups per page
+    const orderNumbers = Array.from(new Set(orders.map(o => o.order_number).filter(Boolean)));
+    let ssMap = new Map(); // order_number -> { tracking, shipDateIso }
+    let seMap = new Map();
+    let llMap = new Map();
+
+    if (orderNumbers.length) {
+      // ShipStation batch by order_number
+      const { data: ssRows, error: ssErr } = await supabase
+        .from('shipstation_events')
+        .select('order_id, order_number, tracking_number, ship_date, create_date, voided, is_return_label')
+        .in('order_number', orderNumbers)
+        .neq('voided', true)
+        .neq('is_return_label', true)
+        .not('tracking_number', 'is', null)
+        .order('create_date', { ascending: false });
+      if (ssErr) console.error('[FixOrders] ShipStation batch error:', ssErr);
+      for (const r of ssRows || []) {
+        const on = r.order_number;
+        if (!on) continue;
+        if (!ssMap.has(on)) {
+          const tracking = (r.tracking_number || '').trim();
+          if (!tracking) continue;
+          const shipDateIso = toIsoOrNull(r.ship_date) || toIsoOrNull(r.create_date);
+          ssMap.set(on, { tracking, shipDateIso });
+        }
+      }
+
+      // ShipEngine batch by order_number
+      const { data: seRows, error: seErr } = await supabase
+        .from('shipengine_events')
+        .select('order_number, tracking_number, ship_date, create_date, voided, is_return_label')
+        .in('order_number', orderNumbers)
+        .neq('voided', true)
+        .neq('is_return_label', true)
+        .not('tracking_number', 'is', null)
+        .order('create_date', { ascending: false });
+      if (seErr) console.error('[FixOrders] ShipEngine batch error:', seErr);
+      for (const r of seRows || []) {
+        const on = r.order_number;
+        if (!on) continue;
+        if (!seMap.has(on)) {
+          const tracking = (r.tracking_number || '').trim();
+          if (!tracking) continue;
+          const shipDateIso = toIsoOrNull(r.ship_date) || toIsoOrNull(r.create_date);
+          seMap.set(on, { tracking, shipDateIso });
+        }
+      }
+
+      // Label ledger batch by order_ref
+      const { data: llRows, error: llErr } = await supabase
+        .from('label_ledger')
+        .select('order_ref, tracking_number, created_at, raw_payload, raw_response')
+        .in('order_ref', orderNumbers)
+        .not('tracking_number', 'is', null)
+        .order('created_at', { ascending: false });
+      if (llErr) console.error('[FixOrders] Label ledger batch error:', llErr);
+      for (const r of llRows || []) {
+        const on = r.order_ref;
+        if (!on) continue;
+        if (!llMap.has(on)) {
+          const tracking = (r.tracking_number || '').trim();
+          if (!tracking) continue;
+          const shipDateIso = extractShipDateFromLabelLedgerRow(r) || toIsoOrNull(r.created_at);
+          llMap.set(on, { tracking, shipDateIso });
+        }
+      }
+    }
+
     for (const o of orders) {
       try {
-        const ss = await findFromShipStation(o.order_id, o.order_number);
-        const se = ss ? null : await findFromShipEngine(o.order_number);
-        const ll = (ss || se) ? null : await findFromLabelLedger(o.order_number);
+        const ss = ssMap.get(o.order_number) || null;
+        const se = ss ? null : (seMap.get(o.order_number) || null);
+        const ll = (ss || se) ? null : (llMap.get(o.order_number) || null);
         const found = ss || se || ll;
         if (!found) continue;
 

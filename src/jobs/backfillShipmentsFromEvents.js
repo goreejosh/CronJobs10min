@@ -18,21 +18,6 @@ function toIsoOrNull(value) {
   }
 }
 
-async function findOrderByOrderNumber(orderNumber) {
-  if (!orderNumber) return null;
-  const { data, error } = await supabase
-    .from('orders')
-    .select('order_id, store_id')
-    .eq('order_number', orderNumber)
-    .limit(1)
-    .maybeSingle();
-  if (error) {
-    console.error('[Backfill] orders lookup error:', error);
-    return null;
-  }
-  return data || null;
-}
-
 async function findShipmentByTracking(trackingNumber) {
   if (!trackingNumber) return null;
   const { data, error } = await supabase
@@ -46,6 +31,27 @@ async function findShipmentByTracking(trackingNumber) {
     return null;
   }
   return data || null;
+}
+
+async function findOrderRow(orderNumber, storeId) {
+  if (!orderNumber) return null;
+  try {
+    let query = supabase
+      .from('orders')
+      .select('order_id, store_id')
+      .eq('order_number', orderNumber)
+      .limit(1);
+    if (storeId != null) query = query.eq('store_id', storeId);
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      console.error('[Backfill] orders lookup error:', error);
+      return null;
+    }
+    return data || null;
+  } catch (e) {
+    console.error('[Backfill] orders lookup exception:', e);
+    return null;
+  }
 }
 
 function makeShipmentRowFromShipStationEvent(evt, orderRow) {
@@ -163,56 +169,25 @@ function buildUpdateForMissingFields(existing, candidate) {
   return update;
 }
 
-async function upsertShipmentFromShipStationEvent(evt) {
-  const tracking = (evt?.tracking_number || '').trim();
-  if (!tracking) return;
-
-  const existing = await findShipmentByTracking(tracking);
-  const orderRow = await findOrderByOrderNumber(evt.order_number);
-  const candidate = makeShipmentRowFromShipStationEvent(evt, orderRow);
-
-  if (!existing) {
-    const { error } = await supabase
-      .from('shipments')
-      .insert([candidate], { returning: 'minimal' });
-    if (error) console.error('[Backfill] insert shipments (ShipStation) error:', error);
-    return;
+function buildOrderMaps(ordersList) {
+  const byComposite = new Map(); // key: order_number|store_id
+  const byNumber = new Map();    // key: order_number
+  for (const r of ordersList || []) {
+    const on = r.order_number;
+    const sid = r.store_id;
+    const key = `${on}|${sid ?? 'null'}`;
+    byComposite.set(key, r);
+    if (!byNumber.has(on)) byNumber.set(on, r);
   }
-
-  const update = buildUpdateForMissingFields(existing, candidate);
-  if (Object.keys(update).length > 0) {
-    const { error } = await supabase
-      .from('shipments')
-      .update(update)
-      .eq('id', existing.id);
-    if (error) console.error('[Backfill] update shipments (ShipStation) error:', error);
-  }
+  return { byComposite, byNumber };
 }
 
-async function upsertShipmentFromShipEngineEvent(evt) {
-  const tracking = (evt?.tracking_number || '').trim();
-  if (!tracking) return;
-
-  const existing = await findShipmentByTracking(tracking);
-  const orderRow = await findOrderByOrderNumber(evt.order_number);
-  const candidate = makeShipmentRowFromShipEngineEvent(evt, orderRow);
-
-  if (!existing) {
-    const { error } = await supabase
-      .from('shipments')
-      .insert([candidate], { returning: 'minimal' });
-    if (error) console.error('[Backfill] insert shipments (ShipEngine) error:', error);
-    return;
+function buildExistingShipmentMap(rows) {
+  const map = new Map();
+  for (const r of rows || []) {
+    if (r.tracking_number) map.set(r.tracking_number, r);
   }
-
-  const update = buildUpdateForMissingFields(existing, candidate);
-  if (Object.keys(update).length > 0) {
-    const { error } = await supabase
-      .from('shipments')
-      .update(update)
-      .eq('id', existing.id);
-    if (error) console.error('[Backfill] update shipments (ShipEngine) error:', error);
-  }
+  return map;
 }
 
 async function processShipStationEvents(sinceIso) {
@@ -222,7 +197,7 @@ async function processShipStationEvents(sinceIso) {
     const to = from + PAGE_SIZE - 1;
     const { data, error } = await supabase
       .from('shipstation_events')
-      .select('shipstation_id, order_id, order_number, tracking_number, carrier_code, service_code, package_code, confirmation, warehouse_id, shipment_cost, insurance_cost, fulfillment_fee, create_date, ship_date, voided, is_return_label, marketplace_notified, notify_error_message, source_type')
+      .select('shipstation_id, order_id, order_number, store_id, tracking_number, carrier_code, service_code, package_code, confirmation, warehouse_id, shipment_cost, insurance_cost, fulfillment_fee, create_date, ship_date, voided, is_return_label, marketplace_notified, notify_error_message, source_type')
       .gte('create_date', sinceIso)
       .neq('voided', true)
       .neq('is_return_label', true)
@@ -234,8 +209,62 @@ async function processShipStationEvents(sinceIso) {
       break;
     }
     if (!data || data.length === 0) break;
+    // Batch prep
+    const trackings = Array.from(new Set((data.map(e => (e.tracking_number || '').trim())).filter(Boolean)));
+    const orderNumbers = Array.from(new Set((data.map(e => e.order_number).filter(Boolean))));
+
+    // Batch fetch existing shipments
+    let existingMap = new Map();
+    if (trackings.length) {
+      const { data: existingRows, error: existErr } = await supabase
+        .from('shipments')
+        .select('id, tracking_number, order_number, order_id, create_date, ship_date, carrier_code, service_code, package_code, source, source_api_shipment_id, shipengine_label_id, shipstation_actual_shipment_id')
+        .in('tracking_number', trackings);
+      if (existErr) console.error('[Backfill] existing shipments batch error:', existErr);
+      existingMap = buildExistingShipmentMap(existingRows);
+    }
+
+    // Batch fetch orders
+    let orderMaps = { byComposite: new Map(), byNumber: new Map() };
+    if (orderNumbers.length) {
+      const { data: orderRows, error: ordErr } = await supabase
+        .from('orders')
+        .select('order_id, order_number, store_id')
+        .in('order_number', orderNumbers);
+      if (ordErr) console.error('[Backfill] orders batch error:', ordErr);
+      orderMaps = buildOrderMaps(orderRows);
+    }
+
+    const inserts = [];
+    const updates = [];
     for (const evt of data) {
-      try { await upsertShipmentFromShipStationEvent(evt); } catch (e) { console.error('[Backfill] ShipStation upsert error:', e); }
+      try {
+        const tracking = (evt?.tracking_number || '').trim();
+        if (!tracking) continue;
+        const existing = existingMap.get(tracking) || null;
+
+        const ordKey = `${evt.order_number}|${evt.store_id ?? 'null'}`;
+        const orderRow = orderMaps.byComposite.get(ordKey) || orderMaps.byNumber.get(evt.order_number) || null;
+        const candidate = makeShipmentRowFromShipStationEvent(evt, orderRow);
+
+        if (!existing) {
+          inserts.push(candidate);
+          continue;
+        }
+        const update = buildUpdateForMissingFields(existing, candidate);
+        if (Object.keys(update).length > 0) updates.push({ id: existing.id, update });
+      } catch (e) {
+        console.error('[Backfill] ShipStation upsert error:', e);
+      }
+    }
+
+    if (inserts.length) {
+      const { error: insErr } = await supabase.from('shipments').insert(inserts, { returning: 'minimal' });
+      if (insErr) console.error('[Backfill] batch insert shipments (ShipStation) error:', insErr);
+    }
+    for (const u of updates) {
+      const { error: updErr } = await supabase.from('shipments').update(u.update).eq('id', u.id);
+      if (updErr) console.error('[Backfill] batch update shipments (ShipStation) error:', updErr);
     }
     if (data.length < PAGE_SIZE) break;
     page += 1;
@@ -261,8 +290,57 @@ async function processShipEngineEvents(sinceIso) {
       break;
     }
     if (!data || data.length === 0) break;
+    // Batch prep
+    const trackings = Array.from(new Set((data.map(e => (e.tracking_number || '').trim())).filter(Boolean)));
+    const orderNumbers = Array.from(new Set((data.map(e => e.order_number).filter(Boolean))));
+
+    let existingMap = new Map();
+    if (trackings.length) {
+      const { data: existingRows, error: existErr } = await supabase
+        .from('shipments')
+        .select('id, tracking_number, order_number, order_id, create_date, ship_date, carrier_code, service_code, package_code, source, source_api_shipment_id, shipengine_label_id, shipstation_actual_shipment_id')
+        .in('tracking_number', trackings);
+      if (existErr) console.error('[Backfill] existing shipments batch error:', existErr);
+      existingMap = buildExistingShipmentMap(existingRows);
+    }
+
+    let orderMaps = { byComposite: new Map(), byNumber: new Map() };
+    if (orderNumbers.length) {
+      const { data: orderRows, error: ordErr } = await supabase
+        .from('orders')
+        .select('order_id, order_number, store_id')
+        .in('order_number', orderNumbers);
+      if (ordErr) console.error('[Backfill] orders batch error:', ordErr);
+      orderMaps = buildOrderMaps(orderRows);
+    }
+
+    const inserts = [];
+    const updates = [];
     for (const evt of data) {
-      try { await upsertShipmentFromShipEngineEvent(evt); } catch (e) { console.error('[Backfill] ShipEngine upsert error:', e); }
+      try {
+        const tracking = (evt?.tracking_number || '').trim();
+        if (!tracking) continue;
+        const existing = existingMap.get(tracking) || null;
+        const orderRow = orderMaps.byNumber.get(evt.order_number) || null;
+        const candidate = makeShipmentRowFromShipEngineEvent(evt, orderRow);
+        if (!existing) {
+          inserts.push(candidate);
+          continue;
+        }
+        const update = buildUpdateForMissingFields(existing, candidate);
+        if (Object.keys(update).length > 0) updates.push({ id: existing.id, update });
+      } catch (e) {
+        console.error('[Backfill] ShipEngine upsert error:', e);
+      }
+    }
+
+    if (inserts.length) {
+      const { error: insErr } = await supabase.from('shipments').insert(inserts, { returning: 'minimal' });
+      if (insErr) console.error('[Backfill] batch insert shipments (ShipEngine) error:', insErr);
+    }
+    for (const u of updates) {
+      const { error: updErr } = await supabase.from('shipments').update(u.update).eq('id', u.id);
+      if (updErr) console.error('[Backfill] batch update shipments (ShipEngine) error:', updErr);
     }
     if (data.length < PAGE_SIZE) break;
     page += 1;
