@@ -1,12 +1,16 @@
 import cron from 'node-cron';
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
+import { runBackfillShipmentsFromEvents } from './jobs/backfillShipmentsFromEvents.js';
+import { runFixShippedOrdersMissingTracking } from './jobs/fixShippedOrdersMissingTracking.js';
 import { buildSkuMaps, buildClientSkuMap, resolveSku, normalizeSku } from './utils/skuResolver.js';
 
 // Load env
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const POLL_CRON = process.env.POLL_CRON || '*/10 * * * *';
+const BACKFILL_CRON = process.env.BACKFILL_CRON || '*/10 * * * *';
+const FIX_ORDERS_CRON = process.env.FIX_ORDERS_CRON || '*/10 * * * *';
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
   console.error('[Cron] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE');
@@ -340,4 +344,14 @@ cron.schedule(POLL_CRON, () => {
 
 // Kick immediately
 runOnce().catch(err => console.error('[Cron] startup error', err));
+
+// New: Backfill shipments from events
+cron.schedule(BACKFILL_CRON, () => {
+  runBackfillShipmentsFromEvents().catch(err => console.error('[Backfill] job error', err));
+});
+
+// New: Fix shipped orders missing tracking/date
+cron.schedule(FIX_ORDERS_CRON, () => {
+  runFixShippedOrdersMissingTracking().catch(err => console.error('[FixOrders] job error', err));
+});
 
